@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, Canvas, Label, Toplevel
 from tkinter.ttk import Progressbar
@@ -430,19 +431,19 @@ class TimelineEditor:
                 f.write(f"{item['name']} {d}\n")
         messagebox.showinfo("Saved", f"Saved to {new_path}")
 
+
+
     def generate_video(self):
         if not self.normalized:
             messagebox.showerror("Error", "No timeline data to generate from.")
             return
-        # Ask where to save output
         out_path = filedialog.asksaveasfilename(defaultextension=".mp4", 
                                                 filetypes=[("MP4 Video", "*.mp4")])
         if not out_path:
             return
-        # Build image list from current configuration and same directory as list_file
+
         base_dir = os.path.dirname(self.list_file)
-        print(f"{base_dir} basedir")
-        imgs = []  # list of (PIL.Image, time)
+        imgs = []
         for entry in self.normalized:
             name = entry['name']
             t = entry['time']
@@ -453,27 +454,26 @@ class TimelineEditor:
         if not imgs:
             messagebox.showerror("Error", "No images loaded from current configuration")
             return
-        # Ensure sorted by time
         imgs.sort(key=lambda x: x[1])
         frame_count = int(self.framerate * self.total_duration)
         w, h = imgs[0][0].size
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         vw = cv2.VideoWriter(out_path, fourcc, self.framerate, (w, h))
-        # Progress bar window
+
         progress_win = Toplevel(self.root)
         progress_win.title("Generating Video")
         tk.Label(progress_win, text="Progress:").pack(padx=10, pady=5)
         progress = Progressbar(progress_win, length=300, mode='determinate')
         progress.pack(padx=10, pady=5)
         self.root.update()
-        # Render frames
+
         start_time = imgs[0][1]
         end_time = imgs[-1][1]
         timespan = end_time - start_time if end_time != start_time else 1.0
         step = timespan / frame_count if frame_count > 0 else 1
-        for i in range(frame_count):
-            t = start_time + i * step
-            # find from/to
+        frame_times = [start_time + i * step for i in range(frame_count)]
+
+        def render_frame(t):
             from_img, to_img = None, None
             for j in range(len(imgs)):
                 if imgs[j][1] <= t:
@@ -489,9 +489,13 @@ class TimelineEditor:
             a_arr = np.array(from_img[0], dtype=np.float32)
             b_arr = np.array(to_img[0], dtype=np.float32)
             frame_arr = (b_arr * alpha + a_arr * (1.0 - alpha)).astype(np.uint8)
-            vw.write(cv2.cvtColor(frame_arr, cv2.COLOR_RGB2BGR))
-            progress['value'] = (i+1) / frame_count * 100
-            progress_win.update()
+            return frame_arr
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for i, frame in enumerate(executor.map(render_frame, frame_times,chunksize=1)):
+                vw.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                progress['value'] = (i + 1) / frame_count * 100
+                progress_win.update()
         vw.release()
         progress_win.destroy()
         messagebox.showinfo("Done", f"Video saved to {out_path}")
