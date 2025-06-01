@@ -430,9 +430,7 @@ class TimelineEditor:
             for item, d in zip(sorted_items, delays):
                 f.write(f"{item['name']} {d}\n")
         messagebox.showinfo("Saved", f"Saved to {new_path}")
-
-
-
+            
     def generate_video(self):
         if not self.normalized:
             messagebox.showerror("Error", "No timeline data to generate from.")
@@ -443,23 +441,27 @@ class TimelineEditor:
             return
 
         base_dir = os.path.dirname(self.list_file)
-        imgs = []
-        for entry in self.normalized:
-            name = entry['name']
-            t = entry['time']
-            bmp_path = os.path.join(base_dir, name)
-            if os.path.exists(bmp_path):
-                img = Image.open(bmp_path).convert("RGB")
-                imgs.append((img, t))
-        if not imgs:
-            messagebox.showerror("Error", "No images loaded from current configuration")
-            return
-        imgs.sort(key=lambda x: x[1])
-        frame_count = int(self.framerate * self.total_duration)
-        w, h = imgs[0][0].size
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        vw = cv2.VideoWriter(out_path, fourcc, self.framerate, (w, h))
+        img_paths = [(entry['name'], entry['time']) for entry in self.normalized]
+        img_paths.sort(key=lambda x: x[1])
 
+        frame_count = int(self.framerate * self.total_duration)
+        start_time = img_paths[0][1]
+        end_time = img_paths[-1][1]
+        timespan = end_time - start_time if end_time != start_time else 1.0
+        step = timespan / frame_count if frame_count > 0 else 1
+        frame_times = [start_time + i * step for i in range(frame_count)]
+
+        # Determine output frame size
+        first_img_path = os.path.join(base_dir, img_paths[0][0])
+        first_img = Image.open(first_img_path).convert("RGB")
+        w, h = first_img.size
+        first_img.close()
+
+        # Prepare temp directory
+        temp_dir = os.path.join(base_dir, "output_frames")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Progress window
         progress_win = Toplevel(self.root)
         progress_win.title("Generating Video")
         tk.Label(progress_win, text="Progress:").pack(padx=10, pady=5)
@@ -467,38 +469,93 @@ class TimelineEditor:
         progress.pack(padx=10, pady=5)
         self.root.update()
 
-        start_time = imgs[0][1]
-        end_time = imgs[-1][1]
-        timespan = end_time - start_time if end_time != start_time else 1.0
-        step = timespan / frame_count if frame_count > 0 else 1
-        frame_times = [start_time + i * step for i in range(frame_count)]
+        from collections import defaultdict
+        import threading
 
-        def render_frame(t):
-            from_img, to_img = None, None
-            for j in range(len(imgs)):
-                if imgs[j][1] <= t:
-                    from_img = imgs[j]
-                elif from_img is not None:
-                    to_img = imgs[j]
+        lock = threading.Lock()
+        image_cache = {}
+        usage_count = defaultdict(int)
+
+        def render_frame(i, t):
+            from_name, to_name = None, None
+            from_time, to_time = None, None
+            for j in range(len(img_paths)):
+                if img_paths[j][1] <= t:
+                    from_name = img_paths[j][0]
+                    from_time = img_paths[j][1]
+                elif from_name is not None:
+                    to_name = img_paths[j][0]
+                    to_time = img_paths[j][1]
                     break
-            if to_img is None:
-                from_img = to_img = imgs[-1]
-            ft, tt = from_img[1], to_img[1]
-            size = tt - ft if tt - ft != 0 else 1.0
-            alpha = abs(t - ft) / size
-            a_arr = np.array(from_img[0], dtype=np.float32)
-            b_arr = np.array(to_img[0], dtype=np.float32)
-            frame_arr = (b_arr * alpha + a_arr * (1.0 - alpha)).astype(np.uint8)
-            return frame_arr
+            if to_name is None:
+                from_name = to_name = img_paths[-1][0]
+                from_time = to_time = img_paths[-1][1]
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            for i, frame in enumerate(executor.map(render_frame, frame_times,chunksize=1)):
-                vw.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                progress['value'] = (i + 1) / frame_count * 100
+            with lock:
+                if from_name not in image_cache:
+                    image_cache[from_name] = np.array(Image.open(os.path.join(base_dir, from_name)).convert("RGB"), dtype=np.float32)
+                usage_count[from_name] += 1
+                if to_name not in image_cache:
+                    image_cache[to_name] = np.array(Image.open(os.path.join(base_dir, to_name)).convert("RGB"), dtype=np.float32)
+                usage_count[to_name] += 1
+
+            size = to_time - from_time if to_time != from_time else 1.0
+            alpha = abs(t - from_time) / size
+            a_arr = image_cache[from_name]
+            b_arr = image_cache[to_name]
+            frame_arr = (b_arr * alpha + a_arr * (1.0 - alpha)).astype(np.uint8)
+            out_name = os.path.join(temp_dir, f"frame_{i:06d}.png")
+            cv2.imwrite(out_name, cv2.cvtColor(frame_arr, cv2.COLOR_RGB2BGR))
+
+            with lock:
+                usage_count[from_name] -= 1
+                usage_count[to_name] -= 1
+                if usage_count[from_name] == 0:
+                    del image_cache[from_name]
+                if usage_count[to_name] == 0 and to_name != from_name:
+                    del image_cache[to_name]
+
+            return i
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(render_frame, i, t): i for i, t in enumerate(frame_times)}
+            done = 0
+            for f in as_completed(futures):
+                f.result()
+                done += 1
+                progress['value'] = done / frame_count * 100
                 progress_win.update()
+
+        # Stitch video
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        vw = cv2.VideoWriter(out_path, fourcc, self.framerate, (w, h))
+        for i in range(frame_count):
+            img_path = os.path.join(temp_dir, f"frame_{i:06d}.png")
+            frame = cv2.imread(img_path)
+            vw.write(frame)
+            os.remove(img_path)
         vw.release()
+
         progress_win.destroy()
         messagebox.showinfo("Done", f"Video saved to {out_path}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 if __name__ == "__main__":
     root = tk.Tk()
