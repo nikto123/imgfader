@@ -9,7 +9,7 @@ A fast interactive tool for drawing custom timewarp curves on video playback —
 ### ✅ 1. Clone & enter project
 
 ```bash
-git clone https://your.repo.url/flowsculpt
+git clone https://github.com/nikto123/imgfader
 cd flowsculpt
 ```
 
