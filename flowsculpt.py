@@ -16,7 +16,6 @@ from tkinter import Tk, filedialog, messagebox
 
 # Constants
 FRAME_RATE = 30
-CURVE_RES = 2000
 FREQ_BINS = 256
 CACHE_SIZE = 100
 WINDOW_MIN_HEIGHT = 200
@@ -30,7 +29,8 @@ class VideoScrubber:
         self.wave_env = None
         self.spec_matrix = None
         self.spec_surf0 = None
-        self.frame_curve = np.full(CURVE_RES, 0.5, dtype=np.float32)
+        self.curve_res = 1  # temporary, real value set in load_media()
+        self.frame_curve = np.full(self.curve_res, 0.5, dtype=np.float32) 
         self.frame_cache = {}
         self.undo_stack = []
 
@@ -87,9 +87,9 @@ class VideoScrubber:
                 sys.exit(0)
             with open(path, "r") as f:
                 data = json.load(f)
-            curve = np.array(data["curve"][:CURVE_RES], dtype=np.float32)
-            if curve.size < CURVE_RES:
-                curve = np.pad(curve, (0, CURVE_RES - curve.size), constant_values=0.5)
+            curve = np.array(data["curve"][:self.curve_res], dtype=np.float32)
+            if curve.size < self.curve_res:
+                curve = np.pad(curve, (0, self.curve_res - curve.size), constant_values=0.5)
             self.frame_curve = curve
             return data["video_path"], data["audio_path"]
         else:
@@ -125,6 +125,9 @@ class VideoScrubber:
         # Load audio
         self.audio_data, self.audio_sr = self.load_audio(self.AUDIO_PATH)
         self.audio_duration = len(self.audio_data) / self.audio_sr
+        self.curve_res = int(round(self.audio_duration * FRAME_RATE))
+        
+        self.frame_curve = np.full(self.curve_res, 0.5, dtype=np.float32)
         self.mono_audio = (
             self.audio_data.mean(axis=1)
             if self.audio_data.ndim > 1
@@ -138,9 +141,9 @@ class VideoScrubber:
         self.video_duration = self.total_frames / self.video_fps
 
         # Precompute waveform envelope
-        self.wave_env = np.zeros(CURVE_RES, dtype=np.float32)
-        segment = len(self.mono_audio) // CURVE_RES
-        for i in range(CURVE_RES):
+        self.wave_env = np.zeros(self.curve_res, dtype=np.float32)
+        segment = len(self.mono_audio) // self.curve_res
+        for i in range(self.curve_res):
             start = i * segment
             end = start + segment
             chunk = self.mono_audio[start:end]
@@ -149,9 +152,9 @@ class VideoScrubber:
             )
 
         # Precompute spectrogram matrix
-        self.spec_matrix = np.zeros((FREQ_BINS, CURVE_RES), dtype=np.float32)
-        seg_len = max(1, len(self.mono_audio) // CURVE_RES)
-        for i in range(CURVE_RES):
+        self.spec_matrix = np.zeros((FREQ_BINS, self.curve_res), dtype=np.float32)
+        seg_len = max(1, len(self.mono_audio) // self.curve_res)
+        for i in range(self.curve_res):
             start = i * seg_len
             end = start + seg_len
             chunk = self.mono_audio[start:end]
@@ -194,17 +197,26 @@ class VideoScrubber:
             return
         with open(path, "r") as f:
             data = json.load(f)
+
         self.VIDEO_PATH = data["video_path"]
         self.AUDIO_PATH = data["audio_path"]
-        loaded = np.array(data.get("curve", [])[:CURVE_RES], dtype=np.float32)
-        self.frame_curve[:] = np.pad(
+
+        # Compute curve_res before using it
+        self.audio_data, self.audio_sr = self.load_audio(self.AUDIO_PATH)
+        self.audio_duration = len(self.audio_data) / self.audio_sr
+        self.curve_res = int(round(self.audio_duration * FRAME_RATE))
+
+        loaded = np.array(data.get("curve", [])[:self.curve_res], dtype=np.float32)
+        self.frame_curve = np.pad(
             loaded,
-            (0, max(0, CURVE_RES - len(loaded))),
+            (0, max(0, self.curve_res - len(loaded))),
             constant_values=0.5,
         )
+
         self.load_media()
         self.frame_cache.clear()
         self.undo_stack.clear()
+
 
     def update_layout(self):
         self.window_width, self.window_height = self.screen.get_size()
@@ -272,181 +284,66 @@ class VideoScrubber:
         self.frame_cache[frame_idx] = surface
         return surface
     
-
     def draw_curve_bar(self, surf):
-        height = self.window_height - self.divider_pos
         bar_top = self.divider_pos
-        pygame.draw.rect(surf, (30, 30, 30), (0, bar_top, self.window_width, height))
-        length = CURVE_RES
+        height  = self.window_height - bar_top
+        length  = self.curve_res
 
-        # Compute visible index range
+        # 1) background
+        pygame.draw.rect(surf, (30, 30, 30), (0, bar_top, self.window_width, height))
+
+        # 2) compute visible range
         world_min = self.offset_x
         world_max = (self.window_width / self.zoom_x) + self.offset_x
-        i_min = int(np.floor((world_min / self.window_width) * (length - 1)))
-        i_max = int(np.ceil((world_max / self.window_width) * (length - 1)))
-        i_min = max(0, min(length - 1, i_min))
-        i_max = max(0, min(length - 1, i_max))
+        i_min = max(0, min(length-1, int((world_min/self.window_width)*(length-1))))
+        i_max = max(0, min(length-1, int((world_max/self.window_width)*(length-1))))
+        slice_w = i_max - i_min + 1
 
+        # 3) draw spectrogram or waveform
         if self.spec_mode and self.spec_surf0 is not None:
-            if i_max >= i_min:
-                slice_width = i_max - i_min + 1
-                sub = self.spec_surf0.subsurface((i_min, 0, slice_width, FREQ_BINS))
-                scaled = pygame.transform.scale(sub, (self.window_width, height))
-                surf.blit(scaled, (0, bar_top))
+            # 1) slice out the visible columns
+            spec_slice = self.spec_surf0.subsurface((i_min, 0, slice_w, FREQ_BINS))
+
+            # 2) compute world‐space width = (slice_w / (length−1)) * window_width
+            world_w = (slice_w / (length-1)) * self.window_width
+            sw = int(world_w * self.zoom_x)
+            sh = int(height  * self.zoom_y)
+            spec_surf = pygame.transform.scale(spec_slice, (sw, sh))
+
+            # 3) compute centered vertical position
+            mid  = bar_top + height//2
+            by   = int(mid - sh//2 + self.offset_y)
+            bx   = int(-self.offset_x * self.zoom_x)
+
+            surf.blit(spec_surf, (bx, by))
         else:
-            midpoint = bar_top + (height // 2)
-            for i in range(i_min, i_max + 1):
-                i_norm = i / (length - 1)
-                world_x = i_norm * self.window_width
-                sx = (world_x - self.offset_x) * self.zoom_x
+            mid = bar_top + height//2
+            for i in range(i_min, i_max+1):
+                x = (i/(length-1))*self.window_width
+                sx = int((x - self.offset_x) * self.zoom_x)
+                amp = self.wave_env[i]
+                wy = amp * (height/2)
+                y1 = mid - wy*self.zoom_y + self.offset_y
+                y2 = mid + wy*self.zoom_y + self.offset_y
+                if np.isfinite(y1) and np.isfinite(y2):
+                    pygame.draw.line(surf, (100,100,255), (sx,int(y1)), (sx,int(y2)))
 
-                amp = self.wave_env[i] if self.wave_env is not None else 0.0
-                world_y = amp * (height / 2)
-                sy1 = midpoint - (world_y * self.zoom_y) + self.offset_y
-                sy2 = midpoint + (world_y * self.zoom_y) + self.offset_y
-
-                if np.isfinite(sy1) and np.isfinite(sy2):
-                    pygame.draw.line(
-                        surf,
-                        (100, 100, 255),
-                        (int(sx), int(sy1)),
-                        (int(sx), int(sy2)),
-                    )
-
-        # Draw red frame_curve overlay
+        # 4) red curve overlay
+        cy = height/2
         for i in range(i_min, i_max):
-            i_norm = i / (length - 1)
-            i1_norm = (i + 1) / (length - 1)
-            world_x1 = i_norm * self.window_width
-            world_x2 = i1_norm * self.window_width
-            sx1 = (world_x1 - self.offset_x) * self.zoom_x
-            sx2 = (world_x2 - self.offset_x) * self.zoom_x
+            x1 = (((i  )/(length-1))*self.window_width - self.offset_x)*self.zoom_x
+            x2 = (((i+1)/(length-1))*self.window_width - self.offset_x)*self.zoom_x
+            yv1= (1-self.frame_curve[i])   * height
+            yv2= (1-self.frame_curve[i+1]) * height
+            sy1= bar_top + (cy + (yv1-cy)*self.zoom_y + self.offset_y)
+            sy2= bar_top + (cy + (yv2-cy)*self.zoom_y + self.offset_y)
+            if (0 <= x1 < self.window_width) or (0 <= x2 < self.window_width):
+                pygame.draw.line(surf, (255,0,0), (int(x1),int(sy1)), (int(x2),int(sy2)), 2)
 
-            world_y1 = (1.0 - self.frame_curve[i]) * height
-            world_y2 = (1.0 - self.frame_curve[i + 1]) * height
-            center_world = height / 2
-            dy1 = (world_y1 - center_world) * self.zoom_y
-            dy2 = (world_y2 - center_world) * self.zoom_y
-            sy1 = bar_top + center_world + dy1 + self.offset_y
-            sy2 = bar_top + center_world + dy2 + self.offset_y
-
-            if not (
-                np.isfinite(sx1) and np.isfinite(sy1) and
-                np.isfinite(sx2) and np.isfinite(sy2)
-            ):
-                continue
-
-            if (0 <= sx1 < self.window_width or 0 <= sx2 < self.window_width):
-                pygame.draw.line(
-                    surf,
-                    (255, 0, 0),
-                    (int(sx1), int(sy1)),
-                    (int(sx2), int(sy2)),
-                    2,
-                )
-
-        # Draw green playback cursor
-        world_xc = (self.playback_time / self.audio_duration) * self.window_width
-        cx = (world_xc - self.offset_x) * self.zoom_x
-        if np.isfinite(cx) and 0 <= cx < self.window_width:
-            pygame.draw.line(
-                surf,
-                (0, 255, 0),
-                (int(cx), bar_top),
-                (int(cx), bar_top + height),
-                2,
-            )
-
-        height = self.window_height - self.divider_pos
-        bar_top = self.divider_pos
-        pygame.draw.rect(surf, (30, 30, 30), (0, bar_top, self.window_width, height))
-        length = CURVE_RES
-
-        # Compute visible index range
-        world_min = self.offset_x
-        world_max = (self.window_width / self.zoom_x) + self.offset_x
-        i_min = int(np.floor((world_min / self.window_width) * (length - 1)))
-        i_max = int(np.ceil((world_max / self.window_width) * (length - 1)))
-        i_min = max(0, min(length - 1, i_min))
-        i_max = max(0, min(length - 1, i_max))
-
-        if self.spec_mode and self.spec_surf0 is not None:
-            if i_max >= i_min:
-                slice_width = i_max - i_min + 1
-                sub = self.spec_surf0.subsurface((i_min, 0, slice_width, FREQ_BINS))
-                scaled = pygame.transform.scale(sub, (self.window_width, height))
-                surf.blit(scaled, (0, bar_top))
-        else:
-            midpoint = bar_top + (height // 2)
-            for i in range(i_min, i_max + 1):
-                i_norm = i / (length - 1)
-                world_x = i_norm * self.window_width
-                sx = (world_x - self.offset_x) * self.zoom_x
-
-                amp = self.wave_env[i] if self.wave_env is not None else 0.0
-                # world_y is half-height of waveform at this index
-                world_y = amp * (height / 2)
-
-                # Apply zoom first, then pan in screen coords
-                scaled_y = world_y * self.zoom_y
-                sy1 = midpoint - scaled_y + self.offset_y
-                sy2 = midpoint + scaled_y + self.offset_y
-
-                if np.isfinite(sy1) and np.isfinite(sy2):
-                    pygame.draw.line(
-                        surf,
-                        (100, 100, 255),
-                        (int(sx), int(sy1)),
-                        (int(sx), int(sy2)),
-                    )
-
-        # Draw red frame_curve overlay over same visible range
-        for i in range(i_min, i_max):
-            i_norm = i / (length - 1)
-            i1_norm = (i + 1) / (length - 1)
-            world_x1 = i_norm * self.window_width
-            world_x2 = i1_norm * self.window_width
-            sx1 = (world_x1 - self.offset_x) * self.zoom_x
-            sx2 = (world_x2 - self.offset_x) * self.zoom_x
-
-            # world_curve_y measured from top of bar
-            world_y1 = (1.0 - self.frame_curve[i]) * height
-            world_y2 = (1.0 - self.frame_curve[i + 1]) * height
-
-            # center-based zoom
-            center_world = height / 2
-            dy1 = (world_y1 - center_world) * self.zoom_y
-            dy2 = (world_y2 - center_world) * self.zoom_y
-            sy1 = bar_top + center_world + dy1 + self.offset_y
-            sy2 = bar_top + center_world + dy2 + self.offset_y
-
-            if not (
-                np.isfinite(sx1)
-                and np.isfinite(sy1)
-                and np.isfinite(sx2)
-                and np.isfinite(sy2)
-            ):
-                continue
-            if (0 <= sx1 < self.window_width or 0 <= sx2 < self.window_width):
-                pygame.draw.line(
-                    surf,
-                    (255, 0, 0),
-                    (int(sx1), int(sy1)),
-                    (int(sx2), int(sy2)),
-                    2,
-                )
-
-        # Draw green playback cursor
-        world_xc = (self.playback_time / self.audio_duration) * self.window_width
-        cx = (world_xc - self.offset_x) * self.zoom_x
-        if np.isfinite(cx) and 0 <= cx < self.window_width:
-            pygame.draw.line(
-                surf,
-                (0, 255, 0),
-                (int(cx), bar_top),
-                (int(cx), bar_top + height),
-                2,
-            )
+        # 5) green playback cursor
+        cx = ((self.playback_time/self.audio_duration)*self.window_width - self.offset_x)*self.zoom_x
+        if 0 <= cx < self.window_width:
+            pygame.draw.line(surf, (0,255,0), (int(cx),bar_top), (int(cx),bar_top+height), 2)
 
     def set_curve_at_mouse(self, x, y):
         if y < self.divider_pos:
@@ -463,8 +360,8 @@ class VideoScrubber:
         world_y = ((y - bar_top - center - self.offset_y) / self.zoom_y) + center
 
         norm_x = world_x / self.window_width
-        idx = int(norm_x * (CURVE_RES - 1))
-        idx = max(0, min(CURVE_RES - 1, idx))
+        idx = int(norm_x * (self.curve_res - 1))
+        idx = max(0, min(self.curve_res - 1, idx))
 
         val = 1.0 - (world_y / height)
         val = np.clip(val, 0.0, 1.0)
@@ -505,11 +402,17 @@ class VideoScrubber:
 
         # Compute number of output frames
         num_out = int(round(self.audio_duration * fps))
+        
+        if len(self.frame_curve) != num_out:
+            self.curve_res = num_out
+            self.frame_curve = np.full(self.curve_res, 0.5, dtype=np.float32)
+        
         if num_out <= 0:
             return
 
         # Create a simple Tkinter progress window
         progress_win = Toplevel(self.root)
+        self.root.update()
         progress_win.title("Exporting Video...")
         progress_win.geometry("450x120")
         progress_win.resizable(False, False)
@@ -544,8 +447,8 @@ class VideoScrubber:
     
         for frame_i in range(num_out):
             t = frame_i / fps
-            idx_curve = int((t / self.audio_duration) * (CURVE_RES - 1))
-            idx_curve = max(0, min(CURVE_RES - 1, idx_curve))
+            idx_curve = int((t / self.audio_duration) * (self.curve_res - 1))
+            idx_curve = max(0, min(self.curve_res - 1, idx_curve))
             src_frame_i = int(self.frame_curve[idx_curve] * (total_frames - 1))
             src_frame_i = max(0, min(total_frames - 1, src_frame_i))
 
@@ -583,6 +486,8 @@ class VideoScrubber:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             os.unlink(temp_path)
             status_label.config(text="Export complete!")
+            progress_win.destroy()
+            self.root.update()
         except Exception as e:
             print("ffmpeg failed:", e)
             try: os.unlink(temp_path)
@@ -590,7 +495,7 @@ class VideoScrubber:
             status_label.config(text="Export failed!")
 
         progress_win.update()
-        progress_win.after(1500, progress_win.destroy)
+        progress_win.after(1500, lambda: progress_win.destroy() or self.root.quit())
 
 
     def run(self):
@@ -657,8 +562,8 @@ class VideoScrubber:
                             self.undo_stack.append(self.frame_curve.copy())
                             if len(self.undo_stack) > 100:
                                 self.undo_stack.pop(0)
-                            for i in range(CURVE_RES):
-                                world_x = (i / (CURVE_RES - 1)) * self.window_width
+                            for i in range(self.curve_res):
+                                world_x = (i / (self.curve_res - 1)) * self.window_width
                                 sx = (world_x - self.offset_x) * self.zoom_x
                                 if (x1 <= sx <= x2) or (x2 <= sx <= x1):
                                     t = (sx - x1) / (x2 - x1) if x2 != x1 else 0
@@ -732,8 +637,8 @@ class VideoScrubber:
                     elif mods & pygame.KMOD_SHIFT:
                         x, _ = event.pos
                         raw_norm = ((x / self.zoom_x + self.offset_x) / self.window_width)
-                        idx = int(raw_norm * (CURVE_RES - 1))
-                        idx = max(0, min(CURVE_RES - 1, idx))
+                        idx = int(raw_norm * (self.curve_res - 1))
+                        idx = max(0, min(self.curve_res - 1, idx))
                         if self.hover_index is None or idx != self.hover_index:
                             self.hover_index = idx
                             self.hovering = True
@@ -753,7 +658,7 @@ class VideoScrubber:
 
             # Record mode interpolation
             if self.record_mode:
-                length = CURVE_RES
+                length = self.curve_res
                 world_x = (self.playback_time / self.audio_duration) * self.window_width
                 idx = int((world_x / self.window_width) * (length - 1))
                 idx = max(0, min(length - 1, idx))
