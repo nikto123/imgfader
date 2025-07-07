@@ -25,12 +25,14 @@ ZOOM_STEP = 1.1
 
 class VideoScrubber:
     def __init__(self):
+        # --- Pygame & state init ---
         pygame.init()
         self.wave_env = None
         self.spec_matrix = None
         self.spec_surf0 = None
-        self.curve_res = 1  # temporary, real value set in load_media()
-        self.frame_curve = np.full(self.curve_res, 0.5, dtype=np.float32) 
+        # curve_res will be set in load_media()
+        self.curve_res = 1
+        self.frame_curve = np.full(self.curve_res, 0.5, dtype=np.float32)
         self.frame_cache = {}
         self.undo_stack = []
 
@@ -42,40 +44,51 @@ class VideoScrubber:
         self.playback_time = 0.0
         self.divider_pos = 520
 
-        # Zoom factors and offsets (world units)
+        # Zoom & pan
         self.zoom_x = 1.0
         self.zoom_y = 1.0
-        self.offset_x = 0.0  # horizontal pan
-        self.offset_y = 0.0  # vertical pan
+        self.offset_x = 0.0
+        self.offset_y = 0.0
 
         self.divider_dragging = False
         self.panning = False
         self.zooming = False
 
-        # For polyline drawing (ctrl + click)
+        # Polyline drawing state
         self.ctrl_down = False
         self.line_pts = []
 
         self.hover_index = None
         self.hovering = False
-
         self.last_mouse_idx = None
         self.idx_prev = None
         self.dur_prev = None
 
-        # Tkinter setup for file dialogs
+        # --- Tkinter for file dialogs ---
         self.root = Tk()
         self.root.withdraw()
         self.root.attributes("-topmost", True)
 
-        # Initialize screen placeholders
+        # Screen placeholders
         self.screen = None
         self.window_width = 0
         self.window_height = 0
 
-        # Launch and load media
-        self.VIDEO_PATH, self.AUDIO_PATH = self.launcher()
+        # --- Launcher & media load ---
+        # launcher now returns (video_path, audio_path, optional_curve_list)
+        self.VIDEO_PATH, self.AUDIO_PATH, loaded_curve = self.launcher()
+        # load_media() sets up audio/video, recomputes curve_res & wave_env
         self.load_media()
+
+        # If a curve was provided by launcher, apply it now
+        if loaded_curve is not None:
+            saved = np.array(loaded_curve, dtype=np.float32)[: self.curve_res]
+            if saved.size < self.curve_res:
+                pad = self.curve_res - saved.size
+                saved = np.pad(saved, (0, pad), constant_values=0.5)
+            self.frame_curve = saved.copy()
+
+        # At this point frame_curve will be your loaded curve (or default)
 
     def launcher(self):
         choice = messagebox.askquestion("Video Scrubber", "Load existing project?")
@@ -87,11 +100,8 @@ class VideoScrubber:
                 sys.exit(0)
             with open(path, "r") as f:
                 data = json.load(f)
-            curve = np.array(data["curve"][:self.curve_res], dtype=np.float32)
-            if curve.size < self.curve_res:
-                curve = np.pad(curve, (0, self.curve_res - curve.size), constant_values=0.5)
-            self.frame_curve = curve
-            return data["video_path"], data["audio_path"]
+            # return video_path, audio_path, and the raw JSON curve
+            return data["video_path"], data["audio_path"], data.get("curve", [])
         else:
             video_path = filedialog.askopenfilename(
                 title="Select video file",
@@ -103,7 +113,8 @@ class VideoScrubber:
             )
             if not video_path or not audio_path:
                 sys.exit(0)
-            return video_path, audio_path
+            # no preloaded curve
+            return video_path, audio_path, None
 
     def load_audio(self, path):
         try:
@@ -195,27 +206,27 @@ class VideoScrubber:
         )
         if not path:
             return
+
         with open(path, "r") as f:
             data = json.load(f)
 
+        # 1) Reload audio/video (this resets frame_curve internally)
         self.VIDEO_PATH = data["video_path"]
         self.AUDIO_PATH = data["audio_path"]
-
-        # Compute curve_res before using it
-        self.audio_data, self.audio_sr = self.load_audio(self.AUDIO_PATH)
-        self.audio_duration = len(self.audio_data) / self.audio_sr
-        self.curve_res = int(round(self.audio_duration * FRAME_RATE))
-
-        loaded = np.array(data.get("curve", [])[:self.curve_res], dtype=np.float32)
-        self.frame_curve = np.pad(
-            loaded,
-            (0, max(0, self.curve_res - len(loaded))),
-            constant_values=0.5,
-        )
-
         self.load_media()
+
+        # 2) Now override with the saved curve
+        saved = np.array(data.get("curve", []), dtype=np.float32)
+        saved = saved[: self.curve_res]
+        if saved.size < self.curve_res:
+            pad = self.curve_res - saved.size
+            saved = np.pad(saved, (0, pad), constant_values=0.5)
+        self.frame_curve = saved.copy()
+
+        # 3) Clear caches/undo so the new curve shows immediately
         self.frame_cache.clear()
         self.undo_stack.clear()
+
 
 
     def update_layout(self):
@@ -292,58 +303,70 @@ class VideoScrubber:
         # 1) background
         pygame.draw.rect(surf, (30, 30, 30), (0, bar_top, self.window_width, height))
 
-        # 2) compute visible range
+        # 2) compute visible range in indices
         world_min = self.offset_x
         world_max = (self.window_width / self.zoom_x) + self.offset_x
-        i_min = max(0, min(length-1, int((world_min/self.window_width)*(length-1))))
-        i_max = max(0, min(length-1, int((world_max/self.window_width)*(length-1))))
-        slice_w = i_max - i_min + 1
+        i_min = max(0, min(length - 1, int((world_min / self.window_width) * (length - 1))))
+        i_max = max(0, min(length - 1, int((world_max / self.window_width) * (length - 1))))
 
-        # 3) draw spectrogram or waveform
-        if self.spec_mode and self.spec_surf0 is not None:
-            # 1) slice out the visible columns
-            spec_slice = self.spec_surf0.subsurface((i_min, 0, slice_w, FREQ_BINS))
-
-            # 2) compute world‐space width = (slice_w / (length−1)) * window_width
-            world_w = (slice_w / (length-1)) * self.window_width
-            sw = int(world_w * self.zoom_x)
-            sh = int(height  * self.zoom_y)
-            spec_surf = pygame.transform.scale(spec_slice, (sw, sh))
-
-            # 3) compute centered vertical position
-            mid  = bar_top + height//2
-            by   = int(mid - sh//2 + self.offset_y)
-            bx   = int(-self.offset_x * self.zoom_x)
-
-            surf.blit(spec_surf, (bx, by))
-        else:
-            mid = bar_top + height//2
-            for i in range(i_min, i_max+1):
-                x = (i/(length-1))*self.window_width
-                sx = int((x - self.offset_x) * self.zoom_x)
+        # 3) draw waveform (one spike per screen‐px, clipped to visible)
+        mid = bar_top + height // 2
+        vis_count = i_max - i_min + 1
+        if vis_count > 0:
+            import math
+            step = max(1, math.ceil(vis_count / self.window_width))
+            for i in range(i_min, i_max + 1, step):
+                x_world = (i / (length - 1)) * self.window_width
+                sx = int((x_world - self.offset_x) * self.zoom_x)
+                if sx < 0 or sx >= self.window_width:
+                    continue
                 amp = self.wave_env[i]
-                wy = amp * (height/2)
-                y1 = mid - wy*self.zoom_y + self.offset_y
-                y2 = mid + wy*self.zoom_y + self.offset_y
-                if np.isfinite(y1) and np.isfinite(y2):
-                    pygame.draw.line(surf, (100,100,255), (sx,int(y1)), (sx,int(y2)))
+                wy = amp * (height / 2)
+                y1 = mid - wy * self.zoom_y + self.offset_y
+                y2 = mid + wy * self.zoom_y + self.offset_y
+                pygame.draw.line(surf, (100, 100, 255), (sx, int(y1)), (sx, int(y2)))
 
-        # 4) red curve overlay
-        cy = height/2
-        for i in range(i_min, i_max):
-            x1 = (((i  )/(length-1))*self.window_width - self.offset_x)*self.zoom_x
-            x2 = (((i+1)/(length-1))*self.window_width - self.offset_x)*self.zoom_x
-            yv1= (1-self.frame_curve[i])   * height
-            yv2= (1-self.frame_curve[i+1]) * height
-            sy1= bar_top + (cy + (yv1-cy)*self.zoom_y + self.offset_y)
-            sy2= bar_top + (cy + (yv2-cy)*self.zoom_y + self.offset_y)
-            if (0 <= x1 < self.window_width) or (0 <= x2 < self.window_width):
-                pygame.draw.line(surf, (255,0,0), (int(x1),int(sy1)), (int(x2),int(sy2)), 2)
+            center_y = bar_top + height/2
+            for i in range(i_min, i_max):
+                # screen Xs (pan+zoom)
+                x1 = ((i   /(length-1) * self.window_width) - self.offset_x) * self.zoom_x
+                x2 = (((i+1)/(length-1) * self.window_width) - self.offset_x) * self.zoom_x
 
-        # 5) green playback cursor
-        cx = ((self.playback_time/self.audio_duration)*self.window_width - self.offset_x)*self.zoom_x
+                # normalized Y → [0..height]
+                yv1 = (1 - self.frame_curve[i])   * height
+                yv2 = (1 - self.frame_curve[i+1]) * height
+
+                # offset around center, then pan/zoom
+                sy1 = center_y + (yv1 - height/2) * self.zoom_y + self.offset_y
+                sy2 = center_y + (yv2 - height/2) * self.zoom_y + self.offset_y
+
+                # only draw if at least partly on‐screen
+                if (0 <= x1 < self.window_width) or (0 <= x2 < self.window_width):
+                    pygame.draw.line(
+                        surf,
+                        (255,0,0),
+                        (int(x1), int(sy1)),
+                        (int(x2), int(sy2)),
+                        2
+                    )
+                    
+        mid = bar_top + height // 2
+        # find the maximum envelope value across the entire track
+        global_max = float(self.wave_env.max()) if self.wave_env.size else 1.0
+        wy = global_max * (height / 2)
+        y1 = mid - wy * self.zoom_y + self.offset_y
+        y2 = mid + wy * (self.zoom_y) + self.offset_y
+
+        cx = ((self.playback_time / self.audio_duration) * self.window_width
+              - self.offset_x) * self.zoom_x
         if 0 <= cx < self.window_width:
-            pygame.draw.line(surf, (0,255,0), (int(cx),bar_top), (int(cx),bar_top+height), 2)
+            pygame.draw.line(
+                surf,
+                (0, 255, 0),
+                (int(cx), int(y1)),
+                (int(cx), int(y2)),
+                2
+            )
 
     def set_curve_at_mouse(self, x, y):
         if y < self.divider_pos:
