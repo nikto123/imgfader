@@ -409,12 +409,9 @@ class VideoScrubber:
 
         self.last_mouse_idx = idx
 
-
-
     def export_video(self, fps=60):
         from tkinter import Toplevel, ttk
 
-        # Prompt for save location
         save_path = filedialog.asksaveasfilename(
             defaultextension=".mp4",
             filetypes=[("MP4 files", "*.mp4")],
@@ -423,17 +420,21 @@ class VideoScrubber:
         if not save_path:
             return
 
-        # Compute number of output frames
         num_out = int(round(self.audio_duration * fps))
-        
-        if len(self.frame_curve) != num_out:
-            self.curve_res = num_out
-            self.frame_curve = np.full(self.curve_res, 0.5, dtype=np.float32)
-        
         if num_out <= 0:
             return
 
-        # Create a simple Tkinter progress window
+        # local resample for export only; do NOT touch self.frame_curve / self.curve_res
+        old = self.frame_curve.astype(np.float32, copy=False)
+        old_n = len(old)
+        if old_n == num_out:
+            curve_export = old
+        else:
+            x_old = np.linspace(0.0, 1.0, old_n, endpoint=True)
+            x_new = np.linspace(0.0, 1.0, num_out, endpoint=True)
+            curve_export = np.interp(x_new, x_old, old).astype(np.float32)
+
+        # progress window
         progress_win = Toplevel(self.root)
         self.root.update()
         progress_win.title("Exporting Video...")
@@ -452,40 +453,30 @@ class VideoScrubber:
         status_label = ttk.Label(progress_win, text=f"Frame 0 / {num_out}")
         status_label.pack()
 
-        # Temporary raw video (no audio)
         temp_vid = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         temp_vid.close()
         temp_path = temp_vid.name
 
-        # Open fresh VideoCapture and get dimensions
         cap_export = cv2.VideoCapture(self.VIDEO_PATH)
         total_w = int(cap_export.get(cv2.CAP_PROP_FRAME_WIDTH))
         total_h = int(cap_export.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap_export.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Prepare VideoWriter for raw frames
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(temp_path, fourcc, fps, (total_w, total_h))
 
-    
         for frame_i in range(num_out):
-            t = frame_i / fps
-            idx_curve = int((t / self.audio_duration) * (self.curve_res - 1))
-            idx_curve = max(0, min(self.curve_res - 1, idx_curve))
-            src_frame_i = int(self.frame_curve[idx_curve] * (total_frames - 1))
+            src_frame_i = int(curve_export[frame_i] * (total_frames - 1))
             src_frame_i = max(0, min(total_frames - 1, src_frame_i))
 
             cap_export.set(cv2.CAP_PROP_POS_FRAMES, src_frame_i)
             ret, frame = cap_export.read()
             if ret:
                 writer.write(frame)
-            # if ret is False, skip but continue instead of breaking
             else:
-                # still update progress so UI doesn't freeze
-                pass
+                pass  # keep behavior as-is; main fix here is not mutating curve_res/wave_env
 
-            # Update progress bar and status label
-            pb['value'] = frame_i + 1
+            pb["value"] = frame_i + 1
             status_label.config(text=f"Frame {frame_i + 1} / {num_out}")
             progress_win.update()
 
@@ -513,8 +504,10 @@ class VideoScrubber:
             self.root.update()
         except Exception as e:
             print("ffmpeg failed:", e)
-            try: os.unlink(temp_path)
-            except: pass
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
             status_label.config(text="Export failed!")
 
         progress_win.update()

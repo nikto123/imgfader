@@ -104,16 +104,23 @@ class TimelineEditor:
             return
 
         self.entries.clear()
+        self.curve_points = []
         with open(self.list_file, 'r') as f:
             for line in f:
                 parts = line.strip().split()
-                if len(parts) == 2:
+                if not parts:
+                    continue
+                if parts[0] == 'CURVE':
+                    # e.g. "CURVE 0.0 0.2 0.5 ... 1.0"
+                    self.curve_points = list(map(float, parts[1:]))
+                elif len(parts) == 2:
                     name, delay = parts
                     self.entries.append((name, float(delay)))
 
         self.build_normalized()
         self.reset_zoom()
-        self.draw_timeline()
+        self.draw_timeline()      # draws points + waveform
+        self.draw_curve()         # then overlay saved curve
 
     def build_normalized(self):
         total_units = sum(delay for _, delay in self.entries)
@@ -143,13 +150,14 @@ class TimelineEditor:
 
     def draw_timeline(self):
         self.timeline.delete("all")
+        self.draw_waveform()
+
         # Total width in px based on zoom
         total_width = int(self.total_duration * self.timeline_zoom)
         h = self.timeline.winfo_height()
-        # set scrollregion
         self.timeline.config(scrollregion=(0, 0, total_width, h))
 
-        # draw playhead at logical x
+        # draw playhead
         x_pos = self.current_position * self.timeline_zoom
         self.timeline.create_line(x_pos, 0, x_pos, h, fill="red", width=2)
 
@@ -161,8 +169,7 @@ class TimelineEditor:
                                      fill=color, tags=(f"point{idx}",))
         if len(self.selected_indices) > 1:
             times = [self.normalized[i]['time'] for i in self.selected_indices]
-            x0 = min(times) * self.timeline_zoom
-            x1 = max(times) * self.timeline_zoom
+            x0, x1 = min(times) * self.timeline_zoom, max(times) * self.timeline_zoom
             self.timeline.create_rectangle(x0, center_y - 10, x1, center_y + 10,
                                            outline="white", dash=(2,2), tags=("group_box",))
             self.timeline.create_rectangle(x0 - 5, center_y - 15, x0 + 5, center_y + 15,
@@ -172,6 +179,65 @@ class TimelineEditor:
         if self.selection_box:
             x0, y0, x1, y1 = self.selection_box
             self.timeline.create_rectangle(x0, y0, x1, y1, outline="yellow", dash=(2,2))
+
+        # **finally** overlay your saved curve
+        self.draw_curve()
+
+    def draw_waveform(self):
+        return
+        """Draw one min/max spike for each 5px slice of the timeline."""
+        if not hasattr(self, 'audio_samples'):
+            return
+
+        samples = self.audio_samples
+        total = len(samples)
+        # total pixel width of the timeline
+        width_px = int(self.total_duration * self.timeline_zoom)
+        if width_px <= 0:
+            return
+
+        bucket_px = 5
+        num_buckets = max(1, width_px // bucket_px)
+        h = self.timeline.winfo_height()
+        center = h // 2
+
+        for b in range(num_buckets):
+            # x-range of this bucket
+            x0 = b * bucket_px
+            x1 = x0 + bucket_px
+            # corresponding sample indices
+            i0 = int(x0 / width_px * total)
+            i1 = min(total, int(x1 / width_px * total))
+            segment = samples[i0:i1]
+            if not segment:
+                continue
+
+            lo = min(segment)
+            hi = max(segment)
+            y_lo = int(lo * (center - 2))
+            y_hi = int(hi * (center - 2))
+            x = x0 + bucket_px / 2
+            self.timeline.create_line(
+                x, center - y_hi,
+                x, center - y_lo,
+                fill='lightgray',
+                tags='waveform'
+            )
+
+
+    def draw_curve(self):
+        """Overlay the curve shape loaded from file."""
+        if not getattr(self, 'curve_points', None):
+            return
+        w = self.timeline.winfo_width()
+        h = self.timeline.winfo_height()
+        pts = []
+        n = len(self.curve_points)
+        for idx, val in enumerate(self.curve_points):
+            x = (idx / (n - 1)) * (self.total_duration * self.timeline_zoom)
+            y = h * (1 - val)
+            pts.extend((x, y))
+        self.timeline.create_line(*pts, fill='orange', smooth=True, tags='curve')
 
     def on_timeline_click(self, event):
         w = self.timeline.winfo_width()
